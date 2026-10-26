@@ -708,7 +708,8 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
-        panel.level = .floating
+        // Alfred's own level: above status-bar-level windows such as the GlobalProtect login, below menus.
+        panel.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 2)
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.hidesOnDeactivate = false
         panel.isMovableByWindowBackground = true  // drag it by the search bar, footer or preview background
