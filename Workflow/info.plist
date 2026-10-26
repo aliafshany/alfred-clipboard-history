@@ -1,0 +1,221 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>bundleid</key>
+	<string>com.andreisuslov.alfred-clipboard-history</string>
+	<key>category</key>
+	<string>Productivity</string>
+	<key>connections</key>
+	<dict>
+		<key>1852BF6E-A073-4E9C-B24B-5FC3906E7EAD</key>
+		<array>
+			<dict>
+				<key>destinationuid</key>
+				<string>2963C07F-B184-4FAD-835C-60D4A17F8FBE</string>
+				<key>modifiers</key>
+				<integer>0</integer>
+				<key>modifiersubtext</key>
+				<string></string>
+				<key>vitoclose</key>
+				<false/>
+			</dict>
+		</array>
+		<key>E52F8C3B-7D40-4B69-8F18-2C906D3E4B7A</key>
+		<array>
+			<dict>
+				<key>destinationuid</key>
+				<string>0741AE5D-9F62-4D8B-A13A-4EB28F506D9C</string>
+				<key>modifiers</key>
+				<integer>0</integer>
+				<key>modifiersubtext</key>
+				<string></string>
+				<key>vitoclose</key>
+				<false/>
+			</dict>
+		</array>
+		<key>F6309D4C-8E51-4C7A-9029-3DA17E4F5C8B</key>
+		<array>
+			<dict>
+				<key>destinationuid</key>
+				<string>0741AE5D-9F62-4D8B-A13A-4EB28F506D9C</string>
+				<key>modifiers</key>
+				<integer>0</integer>
+				<key>modifiersubtext</key>
+				<string></string>
+				<key>vitoclose</key>
+				<false/>
+			</dict>
+		</array>
+	</dict>
+	<key>createdby</key>
+	<string>Andrei Suslov</string>
+	<key>description</key>
+	<string>A Raycast-style window for Alfred's clipboard history</string>
+	<key>disabled</key>
+	<false/>
+	<key>name</key>
+	<string>Clipboard History</string>
+	<key>objects</key>
+	<array>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>argumenttype</key>
+				<integer>2</integer>
+				<key>keyword</key>
+				<string>clipboard</string>
+				<key>skipuniversalaction</key>
+				<true/>
+				<key>subtext</key>
+				<string>Search, paste and drag what you copied</string>
+				<key>text</key>
+				<string>Clipboard History</string>
+				<key>withspace</key>
+				<false/>
+			</dict>
+			<key>type</key>
+			<string>alfred.workflow.input.keyword</string>
+			<key>uid</key>
+			<string>E52F8C3B-7D40-4B69-8F18-2C906D3E4B7A</string>
+			<key>version</key>
+			<integer>1</integer>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>availableviaurlhandler</key>
+				<true/>
+				<key>triggerid</key>
+				<string>show</string>
+			</dict>
+			<key>type</key>
+			<string>alfred.workflow.trigger.external</string>
+			<key>uid</key>
+			<string>F6309D4C-8E51-4C7A-9029-3DA17E4F5C8B</string>
+			<key>version</key>
+			<integer>1</integer>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>concurrently</key>
+				<true/>
+				<key>escaping</key>
+				<integer>0</integer>
+				<key>script</key>
+				<string>open ./ClipHistory.app</string>
+				<key>scriptargtype</key>
+				<integer>1</integer>
+				<key>scriptfile</key>
+				<string></string>
+				<key>type</key>
+				<integer>11</integer>
+			</dict>
+			<key>type</key>
+			<string>alfred.workflow.action.script</string>
+			<key>uid</key>
+			<string>0741AE5D-9F62-4D8B-A13A-4EB28F506D9C</string>
+			<key>version</key>
+			<integer>2</integer>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>availableviaurlhandler</key>
+				<true/>
+				<key>triggerid</key>
+				<string>paste</string>
+			</dict>
+			<key>type</key>
+			<string>alfred.workflow.trigger.external</string>
+			<key>uid</key>
+			<string>1852BF6E-A073-4E9C-B24B-5FC3906E7EAD</string>
+			<key>version</key>
+			<integer>1</integer>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>concurrently</key>
+				<true/>
+				<key>escaping</key>
+				<integer>0</integer>
+				<key>script</key>
+				<string>./ClipHistory.app/Contents/MacOS/ClipHistory --paste</string>
+				<key>scriptargtype</key>
+				<integer>1</integer>
+				<key>scriptfile</key>
+				<string></string>
+				<key>type</key>
+				<integer>11</integer>
+			</dict>
+			<key>type</key>
+			<string>alfred.workflow.action.script</string>
+			<key>uid</key>
+			<string>2963C07F-B184-4FAD-835C-60D4A17F8FBE</string>
+			<key>version</key>
+			<integer>2</integer>
+		</dict>
+	</array>
+	<key>readme</key>
+	<string>A Raycast-style window for Alfred's clipboard history: the list on the left, a preview and an Information panel on the right. Alfred keeps recording the clipboard; this only reads its history.
+
+- ⌃⌘V opens and closes it (the keyword clipboard and Home open it too)
+- Type to filter; the menu at the top right picks Text, Links, Code, Media or Colors
+- ↑↓ move, ↩ or double-click pastes into the app you were in, ⌘↩ copies, Esc closes
+- Drag a row out: text drags as text, images and files as files; shake for a Dropover shelf
+- Drag the window by its background to move it; it remembers where
+
+The app (ClipHistory.app, built from source/ClipboardHistory.swift) starts at login through the LaunchAgent com.andreisuslov.alfred-clipboard-history and registers ⌃⌘V itself, which is what lets it take the keyboard the way Alfred does. It has no Accessibility permission of its own: to paste, it runs the "paste" trigger and Alfred presses ⌘V for it.</string>
+	<key>uidata</key>
+	<dict>
+		<key>0741AE5D-9F62-4D8B-A13A-4EB28F506D9C</key>
+		<dict>
+			<key>xpos</key>
+			<integer>260</integer>
+			<key>ypos</key>
+			<integer>150</integer>
+		</dict>
+		<key>1852BF6E-A073-4E9C-B24B-5FC3906E7EAD</key>
+		<dict>
+			<key>xpos</key>
+			<integer>40</integer>
+			<key>ypos</key>
+			<integer>390</integer>
+		</dict>
+		<key>2963C07F-B184-4FAD-835C-60D4A17F8FBE</key>
+		<dict>
+			<key>xpos</key>
+			<integer>260</integer>
+			<key>ypos</key>
+			<integer>390</integer>
+		</dict>
+		<key>E52F8C3B-7D40-4B69-8F18-2C906D3E4B7A</key>
+		<dict>
+			<key>xpos</key>
+			<integer>40</integer>
+			<key>ypos</key>
+			<integer>150</integer>
+		</dict>
+		<key>F6309D4C-8E51-4C7A-9029-3DA17E4F5C8B</key>
+		<dict>
+			<key>xpos</key>
+			<integer>40</integer>
+			<key>ypos</key>
+			<integer>270</integer>
+		</dict>
+	</dict>
+	<key>variables</key>
+	<dict>
+		<key>hotkey</key>
+		<string>⌃⌘V</string>
+	</dict>
+	<key>variablesdontexport</key>
+	<array/>
+	<key>version</key>
+	<string>26.1</string>
+	<key>webaddress</key>
+	<string>https://github.com/andreisuslov/alfred-clipboard-history</string>
+</dict>
+</plist>
