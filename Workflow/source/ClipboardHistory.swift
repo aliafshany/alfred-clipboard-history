@@ -849,7 +849,8 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         dragWatch = nil
         panel.orderOut(nil)
         if returnFocus, NSApp.isActive, let target {
-            NSApp.yieldActivation(to: target)
+            // macOS 14 only lets the target activate if we yield first; 13 has no such handshake.
+            if #available(macOS 14, *) { NSApp.yieldActivation(to: target) }
             target.activate()
         }
         // Like Raycast, the next opening starts from an empty search at the newest item.
