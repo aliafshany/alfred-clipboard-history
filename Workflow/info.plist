@@ -162,12 +162,14 @@
 	<string>A Raycast-style window for Alfred's clipboard history: the list on the left, a preview and an Information panel on the right. Alfred keeps recording the clipboard; this only reads its history.
 
 - ⌃⌘V opens and closes it (the keyword clipboard and Home open it too)
+- Configure Workflow… at the top of the workflow in Alfred Preferences sets another hotkey, or a bar of cards along the bottom of the screen like Paste's
 - Type to filter; the menu at the top right picks Text, Links, Code, Media or Colors
 - ↑↓ move, ↩ or double-click pastes into the app you were in, ⌘↩ copies, Esc closes
+- ⌘-click or ⇧-click selects several to paste, copy or drag at once; texts paste as one, a line each
 - Drag a row out: text drags as text, images and files as files; shake for a Dropover shelf
 - Drag the window by its background to move it; it remembers where
 
-The app (ClipHistory.app, built from source/ClipboardHistory.swift) starts at login through the LaunchAgent com.andreisuslov.alfred-clipboard-history and registers ⌃⌘V itself, which is what lets it take the keyboard the way Alfred does. It has no Accessibility permission of its own: to paste, it runs the "paste" trigger and Alfred presses ⌘V for it.</string>
+The app (ClipHistory.app, built from source/ClipboardHistory.swift) starts at login through the LaunchAgent com.andreisuslov.alfred-clipboard-history and registers the hotkey itself, which is what lets it take the keyboard the way Alfred does. It has no Accessibility permission of its own: to paste, it runs the "paste" trigger and Alfred presses ⌘V for it.</string>
 	<key>uidata</key>
 	<dict>
 		<key>0741AE5D-9F62-4D8B-A13A-4EB28F506D9C</key>
@@ -206,15 +208,60 @@ The app (ClipHistory.app, built from source/ClipboardHistory.swift) starts at lo
 			<integer>270</integer>
 		</dict>
 	</dict>
-	<key>variables</key>
-	<dict>
-		<key>hotkey</key>
-		<string>⌃⌘V</string>
-	</dict>
+	<key>userconfigurationconfig</key>
+	<array>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>default</key>
+				<string>⌃⌘V</string>
+				<key>placeholder</key>
+				<string>⌃⌘V</string>
+				<key>required</key>
+				<false/>
+				<key>trim</key>
+				<true/>
+			</dict>
+			<key>description</key>
+			<string>Opens and closes the window. Type it with symbols or words, like ⌥⌘V or opt+cmd+v: at least one of ⌃ ⌥ ⇧ ⌘ (ctrl, opt, shift, cmd) and a letter, number, Space or F1–F12. It changes within a couple of seconds of saving.</string>
+			<key>label</key>
+			<string>Hotkey</string>
+			<key>type</key>
+			<string>textfield</string>
+			<key>variable</key>
+			<string>hotkey</string>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>default</key>
+				<string>window</string>
+				<key>pairs</key>
+				<array>
+					<array>
+						<string>Window in the middle, like Raycast</string>
+						<string>window</string>
+					</array>
+					<array>
+						<string>Bar along the bottom, like Paste</string>
+						<string>bar</string>
+					</array>
+				</array>
+			</dict>
+			<key>description</key>
+			<string>The window shows a list with a preview of the selected item. The bar shows cards with large previews of images, and ← → move through them.</string>
+			<key>label</key>
+			<string>Layout</string>
+			<key>type</key>
+			<string>popupbutton</string>
+			<key>variable</key>
+			<string>layout</string>
+		</dict>
+	</array>
 	<key>variablesdontexport</key>
 	<array/>
 	<key>version</key>
-	<string>26.3</string>
+	<string>26.4</string>
 	<key>webaddress</key>
 	<string>https://github.com/andreisuslov/alfred-clipboard-history</string>
 </dict>

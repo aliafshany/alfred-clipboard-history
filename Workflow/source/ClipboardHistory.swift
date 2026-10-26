@@ -8,8 +8,9 @@
 // It's an app bundle (ClipHistory.app, LSUIElement) that starts at login (it keeps its own
 // LaunchAgent, see installLoginAgent) and stays running, so it opens instantly. Like Alfred, it
 // becomes the active app while its window is open; macOS allows that only when the app receives
-// the key press itself (it registers ⌃⌘V, see registerHotKey) or is opened through LaunchServices
-// (the workflow's keyword runs `open`). Closing hands focus back to the app you were in.
+// the key press itself (it registers its hotkey, ⌃⌘V unless set in Configure Workflow, see
+// handleHotKey) or is opened through LaunchServices (the workflow's keyword runs `open`).
+// Closing hands focus back to the app you were in.
 // The app has no Accessibility permission, so to paste it asks Alfred to press ⌘V (askAlfredToPaste).
 //
 // Build: source/build.sh (add --package for a .alfredworkflow)
@@ -246,6 +247,27 @@ struct Clip {
         }
     }
 
+    /// Puts several clips on a pasteboard at once. Texts go as one text, a line each, since a text field
+    /// pastes only the first of several items; anything else goes as an item each, so Finder pastes them all.
+    static func write(_ clips: [Clip], to pasteboard: NSPasteboard) {
+        guard clips.count > 1 else {
+            clips.first?.write(to: pasteboard)
+            return
+        }
+        pasteboard.clearContents()
+        if clips.allSatisfy({ $0.kind == .text }) {
+            pasteboard.setString(clips.map(\.item).joined(separator: "\n"), forType: .string)
+            return
+        }
+        pasteboard.writeObjects(clips.flatMap { clip -> [NSPasteboardWriting] in
+            switch clip.kind {
+            case .text: return [clip.item as NSString]
+            case .image: return clip.namedImageFile.map { [$0 as NSURL] } ?? []
+            case .files: return clip.files as [NSURL]
+            }
+        })
+    }
+
     /// What a dragged row carries: text as text, an image or a file as the file itself.
     var dragWriter: NSPasteboardWriting? {
         switch kind {
@@ -355,6 +377,7 @@ enum Theme {
     static let text = color(0x0000_00E6, 0xFFFF_FFE6)
     static let secondary = color(0x0000_0073, 0xFFFF_FF73)
     static let separator = color(0x0000_0017, 0xFFFF_FF17)
+    static let card = color(0xFFFF_FFFF, 0x2C2C_2EFF)
 }
 
 // MARK: - Views
@@ -614,6 +637,218 @@ final class DetailView: Flipped {
     }
 }
 
+// MARK: - Bottom bar
+
+/// Set in Configure Workflow.
+enum Layout: String {
+    case window  // Raycast's: a list and a preview in a window in the middle of the screen
+    case bar  // Paste's: a row of cards along the bottom of the screen
+}
+
+func isLight(_ color: NSColor) -> Bool {
+    let srgb = color.usingColorSpace(.sRGB) ?? color
+    return 0.299 * srgb.redComponent + 0.587 * srgb.greenComponent + 0.114 * srgb.blueComponent > 0.6
+}
+
+/// The most colorful tone of an app icon, for the header of its cards as in Paste. Pixels count by their
+/// saturation, so Safari is blue rather than the gray of its white background, and they're grouped by hue,
+/// so an icon of many colors such as Chrome's gets the strongest of them rather than a mix of them all.
+func colorfulTone(of icon: NSImage) -> NSColor {
+    let side = 16
+    guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: side, pixelsHigh: side, bitsPerSample: 8,
+                                        samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
+                                        bytesPerRow: 0, bitsPerPixel: 0) else { return .systemGray }
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)
+    icon.draw(in: NSRect(x: 0, y: 0, width: side, height: side))
+    NSGraphicsContext.restoreGraphicsState()
+    // Twelve hues, and grays on their own.
+    var groups = [(red: CGFloat, green: CGFloat, blue: CGFloat, weight: CGFloat)](repeating: (0, 0, 0, 0), count: 13)
+    for x in 0..<side {
+        for y in 0..<side {
+            guard let pixel = bitmap.colorAt(x: x, y: y), pixel.alphaComponent > 0.5 else { continue }
+            let saturation = pixel.saturationComponent
+            let group = saturation < 0.15 ? 12 : min(Int(pixel.hueComponent * 12), 11)
+            let weight = saturation * saturation + 0.02
+            groups[group].red += pixel.redComponent * weight
+            groups[group].green += pixel.greenComponent * weight
+            groups[group].blue += pixel.blueComponent * weight
+            groups[group].weight += weight
+        }
+    }
+    guard let best = groups.max(by: { $0.weight < $1.weight }), best.weight > 0 else { return .systemGray }
+    return NSColor(deviceRed: best.red / best.weight, green: best.green / best.weight, blue: best.blue / best.weight, alpha: 1)
+}
+
+/// A clipping in the bottom bar, drawn like Paste's cards: a header in the color of the app it came from,
+/// with its type and when it was copied, then the content as large as the card allows and a line about it.
+final class Card: Flipped {
+    static let size = NSSize(width: 232, height: 252)
+    static let inset: CGFloat = 4  // room for the selection ring
+    static let shape = NSRect(origin: .zero, size: size).insetBy(dx: inset, dy: inset)
+    static let header = NSRect(x: inset, y: inset, width: shape.width, height: 54)
+    static let body = NSRect(x: inset, y: header.maxY, width: shape.width, height: shape.height - header.height - 26)
+
+    /// Each app's icon and tone, worked out once.
+    static var looks: [String: (icon: NSImage?, tone: NSColor)] = [:]
+    static let thumbnails = NSCache<NSURL, NSImage>()
+    static let ago: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.dateTimeStyle = .named  // "now" rather than "in 0 seconds"
+        return formatter
+    }()
+
+    let kind = label("", size: 13, weight: .semibold)
+    let time = label("", size: 11)
+    let appIcon = NSImageView()
+    let text = NSTextField(wrappingLabelWithString: "")
+    let picture = NSView()  // an image, filling the body
+    let fileIcon = NSImageView()  // a file's thumbnail or icon, whole
+    let footer = label("", size: 11, color: Theme.secondary)
+    var tone = NSColor.systemGray
+    var swatch: NSColor?  // a color clipping's color, filling the body
+    var file: URL?  // whose thumbnail the card is waiting for
+    var isSelected = false { didSet { needsDisplay = true } }
+
+    static func look(_ appPath: String) -> (icon: NSImage?, tone: NSColor) {
+        if let look = looks[appPath] { return look }
+        guard !appPath.isEmpty else { return (nil, .systemGray) }
+        let icon = NSWorkspace.shared.icon(forFile: appPath)
+        looks[appPath] = (icon, colorfulTone(of: icon))
+        return looks[appPath]!
+    }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        kind.frame = NSRect(x: 18, y: 14, width: 150, height: 17)
+        time.frame = NSRect(x: 18, y: 33, width: 150, height: 14)
+        appIcon.frame = NSRect(x: Card.header.maxX - 14 - 34, y: Card.header.midY - 17, width: 34, height: 34)
+        text.frame = Card.body.insetBy(dx: 14, dy: 10)
+        text.cell?.truncatesLastVisibleLine = true
+        picture.frame = Card.body
+        picture.wantsLayer = true
+        picture.layer?.contentsGravity = .resizeAspectFill
+        picture.layer?.masksToBounds = true
+        fileIcon.frame = Card.body.insetBy(dx: 18, dy: 12)
+        fileIcon.imageScaling = .scaleProportionallyUpOrDown
+        footer.frame = NSRect(x: 18, y: Card.body.maxY + 6, width: Card.shape.width - 28, height: 14)
+        [kind, time, appIcon, text, picture, fileIcon, footer].forEach(addSubview)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    /// Clicks and drags go to the collection view, whatever part of the card they start on.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        frame.contains(point) ? self : nil
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let shape = NSBezierPath(roundedRect: Card.shape, xRadius: 10, yRadius: 10)
+        NSGraphicsContext.saveGraphicsState()
+        shape.addClip()
+        Theme.card.setFill()
+        Card.shape.fill()
+        tone.setFill()
+        Card.header.fill()
+        if let swatch {
+            swatch.setFill()
+            Card.body.fill()
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        Theme.border.setStroke()
+        shape.stroke()
+        if isSelected {
+            let ring = NSBezierPath(roundedRect: bounds.insetBy(dx: 1.5, dy: 1.5), xRadius: 12.5, yRadius: 12.5)
+            ring.lineWidth = 3
+            NSColor.controlAccentColor.setStroke()
+            ring.stroke()
+        }
+    }
+
+    func show(_ clip: Clip) {
+        let look = Card.look(clip.appPath)
+        tone = look.tone
+        let onTone = isLight(tone) ? NSColor(white: 0, alpha: 0.85) : .white
+        kind.textColor = onTone
+        time.textColor = onTone.withAlphaComponent(0.75)
+        time.stringValue = Card.ago.localizedString(for: clip.date, relativeTo: Date())
+        appIcon.image = look.icon
+        [text, picture, fileIcon].forEach { $0.isHidden = true }
+        picture.layer?.contents = nil
+        swatch = nil
+        file = nil
+        needsDisplay = true
+        switch clip.kind {
+        case .text where clip.color != nil:
+            kind.stringValue = "Color"
+            swatch = clip.color
+            footer.stringValue = colorValues(clip.color!).hex
+        case .text:
+            let trimmed = clip.item.prefix(600).trimmingCharacters(in: .whitespacesAndNewlines)
+            kind.stringValue = clip.category == .link ? "Link" : clip.category == .code ? "Code" : "Text"
+            text.isHidden = false
+            text.stringValue = trimmed
+            text.font = clip.category == .code ? .monospacedSystemFont(ofSize: 11, weight: .regular) : .systemFont(ofSize: 12)
+            text.textColor = clip.category == .link ? .linkColor : Theme.text
+            footer.stringValue = clip.category == .link
+                ? URL(string: trimmed)?.host ?? "" : "\(clip.characters.formatted()) characters"
+        case .image:
+            let info = clip.imageInfo
+            kind.stringValue = "Image"
+            footer.stringValue = "\(info.dimensions)   \(info.size)"
+            picture.isHidden = false
+            load(clip.dataURL, side: 360) { [weak self] in self?.picture.layer?.contents = $0 }
+        case .files:
+            let files = clip.files
+            kind.stringValue = files.count > 1 ? "\(files.count) Files" : "File"
+            footer.stringValue = clip.title
+            fileIcon.isHidden = false
+            fileIcon.image = nil
+            guard let first = files.first else { return }
+            load(first, side: 200) { [weak self] in self?.fileIcon.image = $0 }
+        }
+    }
+
+    /// Shows a thumbnail now if it's been made before, or once it's ready if the card still shows that file.
+    func load(_ file: URL, side: CGFloat, into show: @escaping (NSImage) -> Void) {
+        if let image = Card.thumbnails.object(forKey: file as NSURL) { return show(image) }
+        self.file = file
+        thumbnail(of: file, side: side) { [weak self] image in
+            Card.thumbnails.setObject(image, forKey: file as NSURL)
+            if self?.file == file { show(image) }
+        }
+    }
+}
+
+final class CardItem: NSCollectionViewItem {
+    override func loadView() { view = Card(frame: NSRect(origin: .zero, size: Card.size)) }
+    override var isSelected: Bool { didSet { (view as? Card)?.isSelected = isSelected } }
+}
+
+final class CardStrip: NSCollectionView {
+    var onDoubleClick: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        super.mouseDown(with: event)
+        if event.clickCount == 2, indexPathForItem(at: convert(event.locationInWindow, from: nil)) != nil {
+            onDoubleClick?()
+        }
+    }
+}
+
+/// Scrolls sideways with a mouse wheel too, which only scrolls up and down.
+final class SidewaysScroll: NSScrollView {
+    override func scrollWheel(with event: NSEvent) {
+        guard abs(event.scrollingDeltaY) > abs(event.scrollingDeltaX), let content = documentView else {
+            return super.scrollWheel(with: event)
+        }
+        var origin = contentView.bounds.origin
+        origin.x -= event.scrollingDeltaY * (event.hasPreciseScrollingDeltas ? 1 : 12)
+        origin.x = max(0, min(origin.x, content.frame.width - contentView.bounds.width))
+        contentView.scroll(to: origin)
+        reflectScrolledClipView(contentView)
+    }
+}
+
 // MARK: - Window
 
 final class Panel: NSPanel {
@@ -666,7 +901,8 @@ func pressCommandV() {
     }
 }
 
-final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate {
+final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate,
+    NSCollectionViewDataSource, NSCollectionViewDelegate, NSWindowDelegate {
     enum Row {
         case header(String)
         case clip(Int)
@@ -676,13 +912,16 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
     static let listWidth: CGFloat = 300
     static let searchHeight: CGFloat = 56
     static let footerHeight: CGFloat = 40
+    static let barHeight = searchHeight + Card.size.height + 14
 
+    let layout: Layout
     let panel: Panel
     let root: Fill
     let search = NSTextField()
     let typeMenu = NSPopUpButton(frame: .zero, pullsDown: false)
     let table = NSTableView()
     let detail: DetailView
+    let cards = CardStrip()
     var footerView: NSView?
     var clips: [Clip] = []
     var loadedStamp = HistoryStamp()
@@ -692,9 +931,12 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
     var thumbnails: [String: NSImage] = [:]
     var target: NSRunningApplication?  // the app ↩ pastes into: whatever was in front when the window opened
     var dragWatch: Timer?
+    var refreshTimer: Timer?
 
-    override init() {
-        let size = Controller.size
+    init(layout: Layout) {
+        self.layout = layout
+        // The bar takes the width of the screen it opens on; this is only a start.
+        let size = layout == .bar ? NSSize(width: 1440, height: Controller.barHeight) : Controller.size
         let bodyTop = Controller.searchHeight + 1
         let bodyHeight = size.height - bodyTop - Controller.footerHeight - 1
         detail = DetailView(frame: NSRect(x: Controller.listWidth + 1, y: bodyTop,
@@ -702,7 +944,7 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         panel = Panel(contentRect: NSRect(origin: .zero, size: size), styleMask: [.borderless, .nonactivatingPanel],
                       backing: .buffered, defer: false)
         let blur = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
-        root = Fill(Theme.window, radius: 12, stroke: Theme.border, frame: blur.bounds)
+        root = Fill(Theme.window, radius: layout == .bar ? 0 : 12, stroke: Theme.border, frame: blur.bounds)
         super.init()
 
         panel.isOpaque = false
@@ -712,7 +954,8 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         panel.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 2)
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.hidesOnDeactivate = false
-        panel.isMovableByWindowBackground = true  // drag it by the search bar, footer or preview background
+        // Drag the window by the search bar, footer or preview background; the bar stays at the bottom.
+        panel.isMovableByWindowBackground = layout == .window
         panel.delegate = self
         panel.onCommandReturn = { [weak self] in self?.use(paste: false) }
         panel.onEscape = { [weak self] in self?.hide() }
@@ -720,8 +963,9 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         blur.material = .popover
         blur.blendingMode = .behindWindow
         blur.state = .active
-        blur.maskImage = roundedMask(radius: 12)
+        if layout == .window { blur.maskImage = roundedMask(radius: 12) }
         panel.contentView = blur
+        root.autoresizingMask = [.width, .height]
         blur.addSubview(root)
 
         search.isBordered = false
@@ -734,6 +978,7 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         ])
         search.delegate = self
         search.frame = NSRect(x: 20, y: 16, width: size.width - 40 - 140, height: 24)
+        search.autoresizingMask = [.width]
         root.addSubview(search)
 
         typeMenu.addItems(withTitles: Controller.types.map(\.title))
@@ -745,8 +990,19 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         typeMenu.sizeToFit()
         typeMenu.frame = NSRect(x: size.width - 20 - typeMenu.frame.width, y: 16,
                                 width: typeMenu.frame.width, height: 24)
+        typeMenu.autoresizingMask = [.minXMargin]
         root.addSubview(typeMenu)
 
+        // Pick up new copies while hidden, so the window opens with them already listed.
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+            guard let self, !self.panel.isVisible else { return }
+            self.refreshIfChanged()
+        }
+
+        guard layout == .window else {
+            addCards(width: size.width)
+            return
+        }
         root.addSubview(Fill(Theme.separator, frame: NSRect(x: 0, y: Controller.searchHeight, width: size.width, height: 1)))
 
         let column = NSTableColumn(identifier: .init("clip"))
@@ -761,6 +1017,7 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         table.delegate = self
         table.target = self
         table.doubleAction = #selector(doubleClicked)
+        table.allowsMultipleSelection = true
         // No .move: dropping a file in Finder must copy it, never take it out of the history.
         table.setDraggingSourceOperationMask([.copy, .link, .generic], forLocal: false)
         let scroll = NSScrollView(frame: NSRect(x: 0, y: bodyTop, width: Controller.listWidth, height: bodyHeight))
@@ -776,12 +1033,39 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         root.addSubview(detail)
         root.addSubview(Fill(Theme.separator, frame: NSRect(x: 0, y: size.height - Controller.footerHeight - 1,
                                                              width: size.width, height: 1)))
+    }
 
-        // Pick up new copies while hidden, so the window opens with them already listed.
-        Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
-            guard let self, !self.panel.isVisible else { return }
-            self.refreshIfChanged()
-        }
+    /// Replaced when the layout changes in Configure Workflow.
+    deinit {
+        refreshTimer?.invalidate()
+        panel.delegate = nil
+    }
+
+    /// The bottom bar's row of cards under the search field, newest on the left.
+    func addCards(width: CGFloat) {
+        let flow = NSCollectionViewFlowLayout()
+        flow.scrollDirection = .horizontal
+        flow.itemSize = Card.size
+        flow.minimumLineSpacing = 8  // between columns, when scrolling sideways
+        flow.sectionInset = NSEdgeInsets(top: 0, left: 14, bottom: 0, right: 14)
+        cards.collectionViewLayout = flow
+        cards.backgroundColors = [.clear]
+        cards.isSelectable = true
+        cards.allowsEmptySelection = false
+        cards.allowsMultipleSelection = true
+        cards.register(CardItem.self, forItemWithIdentifier: .init("card"))
+        cards.dataSource = self
+        cards.delegate = self
+        cards.onDoubleClick = { [weak self] in self?.use(paste: true) }
+        cards.setDraggingSourceOperationMask([.copy, .link, .generic], forLocal: false)
+        let scroll = SidewaysScroll(frame: NSRect(x: 0, y: Controller.searchHeight - 4, width: width,
+                                                  height: Card.size.height + 10))
+        scroll.documentView = cards
+        scroll.drawsBackground = false
+        scroll.hasHorizontalScroller = true
+        scroll.scrollerStyle = .overlay
+        scroll.autoresizingMask = [.width]
+        root.addSubview(scroll)
     }
 
     /// Raycast's action bar: where you are on the left, the main keys on the right.
@@ -807,13 +1091,22 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
             field.sizeToFit()
             return field
         }
+        let count = selectedClips.count
+        let items = count > 1 ? " \(count) Items" : ""
         place(keyCap("↩"))
         place(keyCap("⌘"))
-        place(text("Copy"), gap: 12)
+        place(text("Copy\(items)"), gap: 12)
         place(Fill(Theme.separator, frame: NSRect(x: 0, y: 0, width: 1, height: 16)), gap: 12)
         place(keyCap("↩"))
-        place(text(target?.localizedName.map { "Paste to \($0)" } ?? "Paste"))
+        place(text("Paste\(items)" + (target?.localizedName.map { " to \($0)" } ?? "")))
         return bar
+    }
+
+    /// Rebuilt for the app you were in and for how many items are selected.
+    func showFooter() {
+        footerView?.removeFromSuperview()
+        footerView = footer(width: Controller.size.width, y: Controller.size.height - Controller.footerHeight)
+        root.addSubview(footerView!)
     }
 
     // MARK: Showing and hiding
@@ -828,14 +1121,25 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         let front = NSWorkspace.shared.frontmostApplication
         if front?.processIdentifier != getpid() { target = front }
         refreshIfChanged()
-        footerView?.removeFromSuperview()
-        footerView = footer(width: Controller.size.width, y: Controller.size.height - Controller.footerHeight)
-        root.addSubview(footerView!)
-
-        panel.setFrameOrigin(origin())
+        let screen = screenWithPointer()
+        // The bar spans the bottom of the screen and rises from its edge, as Paste's does.
+        let bar = NSRect(x: screen.frame.minX, y: screen.frame.minY, width: screen.frame.width, height: Controller.barHeight)
+        if layout == .bar {
+            panel.setFrame(bar.offsetBy(dx: 0, dy: -bar.height), display: false)
+        } else {
+            showFooter()
+            panel.setFrameOrigin(origin(on: screen))
+        }
         panel.alphaValue = 1
         panel.ignoresMouseEvents = false
         panel.makeKeyAndOrderFront(nil)
+        if layout == .bar {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.2
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                panel.animator().setFrame(bar, display: true)
+            }
+        }
         // Become the active app, as Raycast does. A window of an inactive app keeps the keyboard only
         // until the active app (a browser updating its page, say) takes it back, which lost keystrokes.
         NSApp.activate(ignoringOtherApps: true)
@@ -902,10 +1206,13 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
 
     // MARK: Position
 
+    func screenWithPointer() -> NSScreen {
+        NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) } ?? NSScreen.main!
+    }
+
     /// Where the window goes: where you last dragged it, or where Alfred's window appears
     /// (centered, its top about 36% down the screen). Remembered relative to the screen's top center.
-    func origin() -> NSPoint {
-        let screen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) } ?? NSScreen.main!
+    func origin(on screen: NSScreen) -> NSPoint {
         let frame = screen.frame
         let size = Controller.size
         let defaults = UserDefaults.standard
@@ -918,7 +1225,7 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
     }
 
     func windowDidMove(_ notification: Notification) {
-        guard panel.isVisible, let frame = panel.screen?.frame else { return }
+        guard layout == .window, panel.isVisible, let frame = panel.screen?.frame else { return }
         UserDefaults.standard.set(Double(panel.frame.minX - frame.midX), forKey: "offsetFromCenter")
         UserDefaults.standard.set(Double(frame.maxY - panel.frame.maxY), forKey: "offsetFromTop")
     }
@@ -926,8 +1233,9 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
     // MARK: Paste and copy
 
     func use(paste: Bool) {
-        guard let clip = selectedClip else { return NSSound.beep() }
-        clip.write(to: .general)
+        let chosen = selectedClips
+        guard !chosen.isEmpty else { return NSSound.beep() }
+        Clip.write(chosen, to: .general)
         hide()
         guard paste, let target else { return }
         whenFrontmost(target, then: askAlfredToPaste)
@@ -967,16 +1275,17 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         let type = typeMenu.indexOfSelectedItem
         rows = []
         // Clips are newest first, so a new day starts only when a clip is older than the current day's start;
-        // titles are formatted once per day rather than once per clip.
+        // titles are formatted once per day rather than once per clip. The bar has no titles: each card
+        // says when it was copied.
         var dayStart = Date.distantFuture
         for (index, clip) in clips.enumerated() where matches(clip, query, type: type) {
-            if clip.date < dayStart {
+            if layout == .window, clip.date < dayStart {
                 dayStart = Calendar.current.startOfDay(for: clip.date)
                 rows.append(.header(dayTitle(clip.date)))
             }
             rows.append(.clip(index))
         }
-        table.reloadData()
+        if layout == .bar { cards.reloadData() } else { table.reloadData() }
         select(rows.firstIndex { if case .clip = $0 { return true } else { return false } })
     }
 
@@ -989,13 +1298,37 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
 
     // MARK: Selection
 
+    /// ⌘-click and ⇧-click select more than one; they're pasted in the order shown.
+    var selectedRows: [Int] {
+        layout == .bar ? cards.selectionIndexPaths.map(\.item).sorted() : Array(table.selectedRowIndexes)
+    }
+
+    /// The row the keyboard moves from and the preview shows: in the list the one clicked last, in the bar
+    /// the rightmost.
+    var selectedRow: Int {
+        layout == .bar ? selectedRows.last ?? -1 : table.selectedRow
+    }
+
     var selectedClip: Clip? {
-        guard table.selectedRow >= 0, case .clip(let index) = rows[table.selectedRow] else { return nil }
+        guard rows.indices.contains(selectedRow), case .clip(let index) = rows[selectedRow] else { return nil }
         return clips[index]
+    }
+
+    var selectedClips: [Clip] {
+        selectedRows.compactMap { row in
+            guard rows.indices.contains(row), case .clip(let index) = rows[row] else { return nil }
+            return clips[index]
+        }
     }
 
     /// Selects a row from the keyboard or after filtering, and shows its preview once.
     func select(_ row: Int?) {
+        if layout == .bar {
+            cards.selectionIndexPaths = row.map { [IndexPath(item: $0, section: 0)] } ?? []
+            // With the same margin as the first card has.
+            if let row { cards.scrollToVisible(cards.frameForItem(at: row).insetBy(dx: -14, dy: 0)) }
+            return
+        }
         selectingFromCode = true
         if let row {
             table.selectRowIndexes([row], byExtendingSelection: false)
@@ -1006,12 +1339,13 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         }
         selectingFromCode = false
         detail.show(selectedClip)
+        showFooter()
     }
 
     /// Moves the selection by `count` items, skipping day titles and stopping at either end.
     func move(by count: Int) {
         let step = count < 0 ? -1 : 1
-        var row = table.selectedRow
+        var row = selectedRow
         var moved = 0
         var candidate = row + step
         while rows.indices.contains(candidate), moved < abs(count) {
@@ -1021,13 +1355,16 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
             }
             candidate += step
         }
-        if row != table.selectedRow { select(row) }
+        if row != selectedRow { select(row) }
     }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
         switch selector {
         case #selector(NSResponder.moveDown(_:)): move(by: 1)
         case #selector(NSResponder.moveUp(_:)): move(by: -1)
+        // In the bar ← and → go through the cards, as in Paste, rather than through the search text.
+        case #selector(NSResponder.moveRight(_:)) where layout == .bar: move(by: 1)
+        case #selector(NSResponder.moveLeft(_:)) where layout == .bar: move(by: -1)
         case #selector(NSResponder.pageDown(_:)), #selector(NSResponder.scrollPageDown(_:)): move(by: 8)
         case #selector(NSResponder.pageUp(_:)), #selector(NSResponder.scrollPageUp(_:)): move(by: -8)
         case #selector(NSResponder.moveToBeginningOfDocument(_:)): move(by: -rows.count)
@@ -1049,19 +1386,25 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         return 36
     }
 
-    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
-        if case .clip = rows[row] { return true }
-        return false
+    /// Day titles never get selected, by a ⇧-click across days either.
+    func tableView(_ tableView: NSTableView, selectionIndexesForProposedSelection proposed: IndexSet) -> IndexSet {
+        proposed.filteredIndexSet { row in
+            guard rows.indices.contains(row), case .clip = rows[row] else { return false }
+            return true
+        }
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
         guard !selectingFromCode else { return }  // select(_:) shows the preview itself
         detail.show(selectedClip)
-        // After a click, keep typing going to the search field, as in Raycast.
-        if panel.firstResponder === table {
-            panel.makeFirstResponder(search)
-            search.currentEditor()?.selectedRange = NSRange(location: search.stringValue.utf16.count, length: 0)
-        }
+        showFooter()
+        if panel.firstResponder === table { keepTyping() }
+    }
+
+    /// After a click, keep typing going to the search field, as in Raycast.
+    func keepTyping() {
+        panel.makeFirstResponder(search)
+        search.currentEditor()?.selectedRange = NSRange(location: search.stringValue.utf16.count, length: 0)
     }
 
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? { RowView() }
@@ -1111,6 +1454,15 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
 
     func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession,
                    willBeginAt screenPoint: NSPoint, forRowIndexes rowIndexes: IndexSet) {
+        dragStarted(session)
+    }
+
+    func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession,
+                   endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        dragEnded(operation)
+    }
+
+    func dragStarted(_ session: NSDraggingSession) {
         session.animatesToStartingPositionsOnCancelOrFail = false
         // Once the drag leaves the window, fade it out so whatever is underneath (a Finder window,
         // Dropover's shelf) can take the drop. The timer runs in .common so it ticks while dragging.
@@ -1124,8 +1476,7 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         dragWatch = watch
     }
 
-    func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession,
-                   endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+    func dragEnded(_ operation: NSDragOperation) {
         dragWatch?.invalidate()
         dragWatch = nil
         if operation.isEmpty && panel.isKeyWindow {
@@ -1135,24 +1486,119 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
             hide()
         }
     }
+
+    // MARK: Cards
+
+    func collectionView(_ collectionView: NSCollectionView, numberOfItemsInSection section: Int) -> Int { rows.count }
+
+    func collectionView(_ collectionView: NSCollectionView,
+                        itemForRepresentedObjectAt indexPath: IndexPath) -> NSCollectionViewItem {
+        let item = collectionView.makeItem(withIdentifier: .init("card"), for: indexPath)
+        if case .clip(let index) = rows[indexPath.item] { (item.view as? Card)?.show(clips[index]) }
+        return item
+    }
+
+    func collectionView(_ collectionView: NSCollectionView, didSelectItemsAt indexPaths: Set<IndexPath>) {
+        keepTyping()
+    }
+
+    func collectionView(_ collectionView: NSCollectionView, didDeselectItemsAt indexPaths: Set<IndexPath>) {
+        keepTyping()  // a ⌘-click that takes a card out of the selection
+    }
+
+    func collectionView(_ collectionView: NSCollectionView, canDragItemsAt indexPaths: Set<IndexPath>,
+                        with event: NSEvent) -> Bool { true }
+
+    func collectionView(_ collectionView: NSCollectionView,
+                        pasteboardWriterForItemAt indexPath: IndexPath) -> NSPasteboardWriting? {
+        guard case .clip(let index) = rows[indexPath.item] else { return nil }
+        return clips[index].dragWriter
+    }
+
+    func collectionView(_ collectionView: NSCollectionView, draggingSession session: NSDraggingSession,
+                        willBeginAt screenPoint: NSPoint, forItemsAt indexPaths: Set<IndexPath>) {
+        dragStarted(session)
+    }
+
+    func collectionView(_ collectionView: NSCollectionView, draggingSession session: NSDraggingSession,
+                        endedAt screenPoint: NSPoint, dragOperation operation: NSDragOperation) {
+        dragEnded(operation)
+    }
 }
 
 // MARK: - Hotkey
 
-/// What ⌃⌘V does; a global so the Carbon callback (a C function) can reach it.
+/// What the hotkey does; a global so the Carbon callback (a C function) can reach it.
 var hotKeyAction: () -> Void = {}
+var registeredHotKey: EventHotKeyRef?
 
-/// Registers ⌃⌘V in this app rather than in Alfred. The key press then reaches this process, which is
-/// what lets macOS make it the active app with the keyboard; a request sent from a script is refused.
-func registerHotKey() {
+/// Has the hotkey run hotKeyAction. The app registers the hotkey itself rather than in Alfred: the key press
+/// then reaches this process, which is what lets macOS make it the active app with the keyboard; a request
+/// sent from a script is refused.
+func handleHotKey() {
     var pressed = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
     InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
         hotKeyAction()
         return noErr
     }, 1, &pressed, nil, nil)
-    var hotKey: EventHotKeyRef?
-    RegisterEventHotKey(UInt32(kVK_ANSI_V), UInt32(controlKey | cmdKey), EventHotKeyID(signature: 0x434C_4950, id: 1),
-                        GetApplicationEventTarget(), 0, &hotKey)
+}
+
+/// Makes `key` with `modifiers` the hotkey, in place of the one before.
+func registerHotKey(key: Int, modifiers: Int) {
+    if let registeredHotKey { UnregisterEventHotKey(registeredHotKey) }
+    registeredHotKey = nil
+    RegisterEventHotKey(UInt32(key), UInt32(modifiers), EventHotKeyID(signature: 0x434C_4950, id: 1),
+                        GetApplicationEventTarget(), 0, &registeredHotKey)
+}
+
+/// A field of the workflow's Configure Workflow sheet. Alfred saves them to prefs.plist in the workflow
+/// folder, next to the app; there's no file until one is changed.
+func setting(_ variable: String) -> String {
+    let prefs = Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("prefs.plist")
+    return NSDictionary(contentsOf: prefs)?[variable] as? String ?? ""
+}
+
+let modifierNames = ["⌃": controlKey, "^": controlKey, "ctrl": controlKey, "control": controlKey,
+                     "⌥": optionKey, "opt": optionKey, "option": optionKey, "alt": optionKey,
+                     "⇧": shiftKey, "shift": shiftKey, "⌘": cmdKey, "cmd": cmdKey, "command": cmdKey]
+let namedKeys = ["space": kVK_Space, "f1": kVK_F1, "f2": kVK_F2, "f3": kVK_F3, "f4": kVK_F4, "f5": kVK_F5, "f6": kVK_F6,
+                 "f7": kVK_F7, "f8": kVK_F8, "f9": kVK_F9, "f10": kVK_F10, "f11": kVK_F11, "f12": kVK_F12]
+
+/// A hotkey written with symbols or words: "⌥⌘V", "opt+cmd+v", "⌃⇧ Space". It needs a modifier, so that
+/// typing the key on its own still types it.
+func parseHotKey(_ text: String) -> (key: Int, modifiers: Int)? {
+    var spaced = text.lowercased()
+    for symbol in ["⌃", "^", "⌥", "⇧", "⌘"] { spaced = spaced.replacingOccurrences(of: symbol, with: " \(symbol) ") }
+    var words = spaced.split { $0 == " " || $0 == "+" }.map(String.init)
+    guard let last = words.popLast(), !words.isEmpty,
+          let key = namedKeys[last] ?? (last.count == 1 ? keyCode(typing: last) : nil) else { return nil }
+    var modifiers = 0
+    for word in words {
+        guard let modifier = modifierNames[word] else { return nil }
+        modifiers |= modifier
+    }
+    return (key, modifiers)
+}
+
+/// The key that types `character` in the keyboard layout, so V is wherever the layout puts it (on Dvorak
+/// too). It looks in the ASCII-capable layout, which finds V while a Russian or Greek layout is selected.
+func keyCode(typing character: String) -> Int? {
+    guard let source = TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?.takeRetainedValue(),
+          let data = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) else { return nil }
+    let layout = Unmanaged<CFData>.fromOpaque(data).takeUnretainedValue() as Data
+    return layout.withUnsafeBytes { bytes -> Int? in
+        guard let layout = bytes.bindMemory(to: UCKeyboardLayout.self).baseAddress else { return nil }
+        // Key codes from 0, so the number row comes before the keypad.
+        for code in 0..<128 {
+            var deadKeys: UInt32 = 0
+            var length = 0
+            var typed = [UniChar](repeating: 0, count: 4)
+            UCKeyTranslate(layout, UInt16(code), UInt16(kUCKeyActionDisplay), 0, UInt32(LMGetKbdType()),
+                           OptionBits(kUCKeyTranslateNoDeadKeysBit), &deadKeys, typed.count, &length, &typed)
+            if String(utf16CodeUnits: typed, count: length).lowercased() == character { return code }
+        }
+        return nil
+    }
 }
 
 /// An Edit menu, never shown (the app has no menu bar), so ⌘A, ⌘C, ⌘V, ⌘X and ⌘Z work in the search
@@ -1174,7 +1620,7 @@ func editMenu() -> NSMenu {
 }
 
 /// Keeps a LaunchAgent that starts the app in the background at login, pointing at wherever the
-/// workflow is installed, so ⌃⌘V works right after logging in. Rewritten only when it differs.
+/// workflow is installed, so the hotkey works right after logging in. Rewritten only when it differs.
 func installLoginAgent() {
     let label = Bundle.main.bundleIdentifier ?? "com.andreisuslov.alfred-clipboard-history"
     let agents = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents")
@@ -1191,17 +1637,40 @@ func installLoginAgent() {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var controller: Controller?
+    var hotKeyText: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.mainMenu = editMenu()
         installLoginAgent()
         pruneImageLinks()
-        controller = Controller()
-        controller?.refreshIfChanged()
         hotKeyAction = { [weak self] in self?.controller?.toggle() }
-        registerHotKey()
-        // At login (the LaunchAgent passes --login) it only starts, ready for ⌃⌘V.
+        handleHotKey()
+        updateSettings()
+        // What's saved in Configure Workflow applies within a couple of seconds, without a restart.
+        Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.updateSettings() }
+        // At login (the LaunchAgent passes --login) it only starts, ready for the hotkey.
         if !CommandLine.arguments.contains("--login") { controller?.show() }
+    }
+
+    func updateSettings() {
+        // The hotkey first: building the window can wait a second or two on the font server at login,
+        // and a press in that time then opens it once it's built rather than going nowhere.
+        updateHotKey()
+        let layout = Layout(rawValue: setting("layout")) ?? .window
+        if layout != controller?.layout {
+            if controller?.panel.isVisible == true { controller?.hide() }
+            controller = Controller(layout: layout)
+            controller?.refreshIfChanged()
+        }
+    }
+
+    /// Registers the hotkey from Configure Workflow when it has changed. An empty or unreadable one is ⌃⌘V.
+    func updateHotKey() {
+        let text = setting("hotkey")
+        guard text != hotKeyText else { return }
+        hotKeyText = text
+        let hotKey = parseHotKey(text) ?? (kVK_ANSI_V, controlKey | cmdKey)
+        registerHotKey(key: hotKey.key, modifiers: hotKey.modifiers)
     }
 
     /// The workflow's keyword and Home entry run `open ClipHistory.app`. For an app that is already

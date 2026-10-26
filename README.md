@@ -12,10 +12,15 @@ Open the window with <kbd>⌃</kbd><kbd>⌘</kbd><kbd>V</kbd> or the `clipboard`
 
 * <kbd>↩</kbd>: Paste into the app you were in.
 * <kbd>⌘</kbd><kbd>↩</kbd>: Copy without pasting.
+* <kbd>⌘</kbd>-click or <kbd>⇧</kbd>-click: Select several, then paste, copy or drag them all at once, in the order shown. Texts paste as one, a line each.
 * <kbd>↑</kbd><kbd>↓</kbd>: Move through the list while typing.
 * <kbd>esc</kbd>: Close the window.
 * Drag a row out of the window to drop it anywhere: text drags as text, images and files as files.
 * Drag the window by its background to move it. It opens there next time.
+
+To use another hotkey, open the workflow in Alfred Preferences, click Configure Workflow… at the top and type it in the Hotkey field, with symbols or words: `⌥⌘V`, `opt+cmd+v`, `ctrl shift space`. It needs at least one of <kbd>⌃</kbd> <kbd>⌥</kbd> <kbd>⇧</kbd> <kbd>⌘</kbd> and a letter, number, Space or F1–F12, and it works a couple of seconds after you save, without restarting anything. Alfred also asks for it when you install the workflow.
+
+Configure Workflow… also has a Layout menu. Bar along the bottom puts a row of cards along the bottom of the screen instead, like [Paste](https://pasteapp.io): each card shows where it was copied from and when, images fill their card, and <kbd>←</kbd><kbd>→</kbd> move through them. <kbd>↩</kbd>, <kbd>⌘</kbd><kbd>↩</kbd>, double-click and dragging work the same in both.
 
 It follows light and dark mode. Colors show as swatches, with their Hex and RGB values:
 
@@ -25,7 +30,7 @@ Requires Alfred 5 with the Powerpack and Clipboard History turned on (turn on it
 
 ## How it works
 
-The window is a small app that comes with the workflow (`ClipHistory.app`). It only reads Alfred's clipboard history, so Alfred keeps recording as usual. It starts at login, so the hotkey works right away, by adding `~/Library/LaunchAgents/com.andreisuslov.alfred-clipboard-history.plist`. To paste, it asks Alfred to press <kbd>⌘</kbd><kbd>V</kbd>, so it needs no permissions of its own.
+The window is a small app that comes with the workflow (`ClipHistory.app`). It only reads Alfred's clipboard history, so Alfred keeps recording as usual. It registers the hotkey itself (Alfred's own hotkeys can't hand it the keyboard) and reads it from the workflow's `prefs.plist`, where Alfred saves Configure Workflow. It starts at login, so the hotkey works right away, by adding `~/Library/LaunchAgents/com.andreisuslov.alfred-clipboard-history.plist`. To paste, it asks Alfred to press <kbd>⌘</kbd><kbd>V</kbd>, so it needs no permissions of its own.
 
 The app isn't notarized. If macOS won't open it after you install the workflow, go to System Settings → Privacy & Security and choose Open Anyway, or right-click the workflow in Alfred Preferences, choose Open in Finder, and run `xattr -dr com.apple.quarantine .` in Terminal from that folder.
 
