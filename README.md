@@ -17,6 +17,10 @@ Open the window with <kbd>⌃</kbd><kbd>⌘</kbd><kbd>V</kbd> or the `clipboard`
 * Drag a row out of the window to drop it anywhere: text drags as text, images and files as files.
 * Drag the window by its background to move it. It opens there next time.
 
+It follows light and dark mode. Colors show as swatches, with their Hex and RGB values:
+
+![Clipboard History showing colors in dark mode](images/clipboard-history-colors.png)
+
 Requires Alfred 5 with the Powerpack and Clipboard History turned on (turn on its Images and Files options to see those too), on macOS 13 or later.
 
 ## How it works
