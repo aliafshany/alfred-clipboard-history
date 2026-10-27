@@ -4,6 +4,7 @@
 // The window is drawn to look like Alfred with the Raycast themes: a list grouped
 // by day on the left, and a preview with an Information panel on the right.
 // ↩ pastes into the app you were in, ⌘↩ copies, and rows drag out as text or files.
+// ⌘⇧P pins an item above the history and ⌘K lists the actions, adding to pinboards among them (see Saved).
 //
 // It's an app bundle (ClipHistory.app, LSUIElement) that starts at login (it keeps its own
 // LaunchAgent, see installLoginAgent) and stays running, so it opens instantly. Like Alfred, it
@@ -24,8 +25,12 @@ import SQLite3
 let alfredDatabases = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Application Support/Alfred/Databases")
 let historyPath = alfredDatabases.appendingPathComponent("clipboard.alfdb").path
+let alfredData = alfredDatabases.appendingPathComponent("clipboard.alfdb.data")  // its images and file lists
 let cacheDir = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Caches/com.andreisuslov.alfred-clipboard-history")
+/// Pins and pinboards, in the folder Alfred gives each workflow for data it keeps.
+let savedDir = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library/Application Support/Alfred/Workflow Data/com.andreisuslov.alfred-clipboard-history")
 
 /// Lowercased and without accents, so typing "cafe" finds "Café".
 func fold(_ text: String) -> String {
@@ -135,7 +140,7 @@ func looksLikeCode(_ item: String) -> Bool {
 }
 
 struct Clip {
-    enum Kind { case text, image, files }  // how Alfred stored it
+    enum Kind: String, Codable { case text, image, files }  // how Alfred stored it
     enum Category { case text, link, code, color, media }  // what the type menu filters by
 
     let kind: Kind
@@ -144,6 +149,7 @@ struct Clip {
     let app: String
     let appPath: String
     let dataHash: String
+    let folder: URL  // where its image or file list is: Alfred's, or the copy a pin or pinboard keeps
     // Worked out once when the history loads (off the main thread), so rows and filtering stay fast.
     let title: String
     let category: Category
@@ -152,13 +158,14 @@ struct Clip {
     let characters: Int  // for the Information panel; counting a long clipping on every selection was slow
     let words: Int
 
-    init(kind: Kind, item: String, date: Date, app: String, appPath: String, dataHash: String) {
+    init(kind: Kind, item: String, date: Date, app: String, appPath: String, dataHash: String, folder: URL = alfredData) {
         self.kind = kind
         self.item = item
         self.date = date
         self.app = app
         self.appPath = appPath
         self.dataHash = dataHash
+        self.folder = folder
         color = kind == .text ? parseColor(item) : nil
         switch kind {
         case .image, .files: category = .media
@@ -179,14 +186,10 @@ struct Clip {
         case .image:
             title = "Image (\(Clip.imageInfo(item).dimensions))"
         case .files:
-            let files = Clip.files(listedIn: Clip.dataURL(dataHash))
+            let files = Clip.files(listedIn: folder.appendingPathComponent(dataHash))
             let first = files.first?.lastPathComponent ?? item
             title = files.count > 1 ? "\(first) and \(files.count - 1) more" : first
         }
-    }
-
-    static func dataURL(_ hash: String) -> URL {
-        alfredDatabases.appendingPathComponent("clipboard.alfdb.data").appendingPathComponent(hash)
     }
 
     static func files(listedIn plist: URL) -> [URL] {
@@ -215,7 +218,10 @@ struct Clip {
         kind == other.kind && (kind == .text ? item == other.item : dataHash == other.dataHash)
     }
 
-    var dataURL: URL { Clip.dataURL(dataHash) }
+    /// What isSameItem compares, as one value for looking clips up in a set.
+    var key: String { kind == .text ? "text:" + item : "\(kind.rawValue):\(dataHash)" }
+
+    var dataURL: URL { folder.appendingPathComponent(dataHash) }
     var files: [URL] { kind == .files ? Clip.files(listedIn: dataURL) : [] }
     var imageInfo: (dimensions: String, size: String) { Clip.imageInfo(item) }
 
@@ -276,6 +282,101 @@ struct Clip {
         case .files: return files.first as NSURL?
         }
     }
+}
+
+/// Pins and pinboards keep what Alfred recorded; the rest is worked out again as they load.
+extension Clip: Codable {
+    enum CodingKeys: CodingKey { case kind, item, date, app, appPath, dataHash }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(kind: try values.decode(Kind.self, forKey: .kind), item: try values.decode(String.self, forKey: .item),
+                  date: try values.decode(Date.self, forKey: .date), app: try values.decode(String.self, forKey: .app),
+                  appPath: try values.decode(String.self, forKey: .appPath),
+                  dataHash: try values.decode(String.self, forKey: .dataHash), folder: Saved.data)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(kind, forKey: .kind)
+        try values.encode(item, forKey: .item)
+        try values.encode(date, forKey: .date)
+        try values.encode(app, forKey: .app)
+        try values.encode(appPath, forKey: .appPath)
+        try values.encode(dataHash, forKey: .dataHash)
+    }
+}
+
+// MARK: - Pins and pinboards
+
+/// Pins, as in Raycast, show above the history; pinboards, as in Paste, are lists you name and fill.
+/// Both hold copies, images and file lists included, so they stay after Alfred deletes the originals.
+struct Saved: Codable {
+    struct Board: Codable {
+        var name: String
+        var items: [Clip]  // newest first
+    }
+
+    var pinned: [Clip] = []  // newest first
+    var boards: [Board] = []
+
+    static let file = savedDir.appendingPathComponent("saved.json")
+    static let data = savedDir.appendingPathComponent("data")
+    static let colors: [NSColor] = [.systemRed, .systemOrange, .systemYellow, .systemGreen, .systemBlue, .systemPurple, .systemPink]
+
+    static func load() -> Saved {
+        guard let json = try? Data(contentsOf: file) else { return Saved() }
+        if let saved = try? JSONDecoder().decode(Saved.self, from: json) { return saved }
+        // Not written over: the folder is set aside with its copies, rather than emptied by the next save.
+        try? FileManager.default.moveItem(at: savedDir, to: savedDir.appendingPathExtension("unreadable"))
+        return Saved()
+    }
+
+    /// Writes the list, and drops the copies of images and file lists that nothing holds any more.
+    func save() {
+        try? FileManager.default.createDirectory(at: Saved.data, withIntermediateDirectories: true)
+        try? JSONEncoder().encode(self).write(to: Saved.file, options: .atomic)
+        let held = Set((pinned + boards.flatMap(\.items)).map(\.dataHash))
+        for file in (try? FileManager.default.contentsOfDirectory(at: Saved.data, includingPropertiesForKeys: nil)) ?? []
+        where !held.contains(file.lastPathComponent) {
+            try? FileManager.default.removeItem(at: file)
+        }
+    }
+
+    /// The clip with its own copy of its image or file list, which Alfred's cleanup doesn't touch.
+    static func keep(_ clip: Clip) -> Clip {
+        guard clip.folder != data else { return clip }
+        if clip.kind != .text {
+            try? FileManager.default.createDirectory(at: data, withIntermediateDirectories: true)
+            try? FileManager.default.copyItem(at: clip.dataURL, to: data.appendingPathComponent(clip.dataHash))
+        }
+        return Clip(kind: clip.kind, item: clip.item, date: clip.date, app: clip.app, appPath: clip.appPath,
+                    dataHash: clip.dataHash, folder: data)
+    }
+
+    func isPinned(_ clip: Clip) -> Bool { pinned.contains { $0.isSameItem(as: clip) } }
+
+    /// A pinboard's dot, in the filter menu and the actions.
+    func dot(_ name: String) -> NSImage? {
+        boards.firstIndex { $0.name == name }.map { swatch(Saved.colors[$0 % Saved.colors.count], side: 10, radius: 5) }
+    }
+}
+
+/// A menu item that runs a closure, for menus built on the spot.
+final class ActionItem: NSMenuItem {
+    let run: () -> Void
+
+    init(_ title: String, key: String = "", _ modifiers: NSEvent.ModifierFlags = [], image: NSImage? = nil,
+         run: @escaping () -> Void) {
+        self.run = run
+        super.init(title: title, action: #selector(chosen), keyEquivalent: key)
+        keyEquivalentModifierMask = modifiers
+        self.image = image
+        target = self
+    }
+    required init(coder: NSCoder) { fatalError() }
+
+    @objc func chosen() { run() }
 }
 
 func withHistory<T>(_ sql: String, _ body: (OpaquePointer?) -> T) -> T? {
@@ -462,6 +563,7 @@ final class RowView: NSTableRowView {
 final class ClipCell: NSTableCellView {
     let icon = NSImageView()
     let title = label("", size: 14)
+    let number = label("", size: 12, color: Theme.secondary)  // ⌘1 to ⌘9 while in view
     var file: URL?  // whose thumbnail this cell is waiting for
 
     init() {
@@ -469,9 +571,12 @@ final class ClipCell: NSTableCellView {
         icon.imageScaling = .scaleProportionallyUpOrDown
         icon.contentTintColor = Theme.secondary
         icon.frame = NSRect(x: 18, y: 8, width: 20, height: 20)
-        title.frame = NSRect(x: 48, y: 9, width: 300 - 48 - 18, height: 18)
+        title.frame = NSRect(x: 48, y: 9, width: 300 - 48 - 18 - 30, height: 18)
+        number.frame = NSRect(x: 300 - 18 - 26, y: 10, width: 26, height: 16)
+        number.alignment = .right
         addSubview(icon)
         addSubview(title)
+        addSubview(number)
     }
     required init?(coder: NSCoder) { fatalError() }
 }
@@ -705,6 +810,7 @@ final class Card: Flipped {
     let picture = NSView()  // an image, filling the body
     let fileIcon = NSImageView()  // a file's thumbnail or icon, whole
     let footer = label("", size: 11, color: Theme.secondary)
+    let number = label("", size: 11, weight: .medium, color: Theme.secondary)  // ⌘1 to ⌘9 while in view
     var tone = NSColor.systemGray
     var swatch: NSColor?  // a color clipping's color, filling the body
     var file: URL?  // whose thumbnail the card is waiting for
@@ -731,8 +837,10 @@ final class Card: Flipped {
         picture.layer?.masksToBounds = true
         fileIcon.frame = Card.body.insetBy(dx: 18, dy: 12)
         fileIcon.imageScaling = .scaleProportionallyUpOrDown
-        footer.frame = NSRect(x: 18, y: Card.body.maxY + 6, width: Card.shape.width - 28, height: 14)
-        [kind, time, appIcon, text, picture, fileIcon, footer].forEach(addSubview)
+        footer.frame = NSRect(x: 18, y: Card.body.maxY + 6, width: Card.shape.width - 28 - 32, height: 14)
+        number.frame = NSRect(x: Card.shape.maxX - 14 - 30, y: Card.body.maxY + 6, width: 30, height: 14)
+        number.alignment = .right
+        [kind, time, appIcon, text, picture, fileIcon, footer, number].forEach(addSubview)
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -764,13 +872,13 @@ final class Card: Flipped {
         }
     }
 
-    func show(_ clip: Clip) {
+    func show(_ clip: Clip, pinned: Bool) {
         let look = Card.look(clip.appPath)
         tone = look.tone
         let onTone = isLight(tone) ? NSColor(white: 0, alpha: 0.85) : .white
         kind.textColor = onTone
         time.textColor = onTone.withAlphaComponent(0.75)
-        time.stringValue = Card.ago.localizedString(for: clip.date, relativeTo: Date())
+        time.stringValue = pinned ? "Pinned" : Card.ago.localizedString(for: clip.date, relativeTo: Date())
         appIcon.image = look.icon
         [text, picture, fileIcon].forEach { $0.isHidden = true }
         picture.layer?.contents = nil
@@ -826,12 +934,17 @@ final class CardItem: NSCollectionViewItem {
 
 final class CardStrip: NSCollectionView {
     var onDoubleClick: (() -> Void)?
+    var onMenu: ((Int?) -> NSMenu?)?  // given the card right-clicked
 
     override func mouseDown(with event: NSEvent) {
         super.mouseDown(with: event)
         if event.clickCount == 2, indexPathForItem(at: convert(event.locationInWindow, from: nil)) != nil {
             onDoubleClick?()
         }
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        onMenu?(indexPathForItem(at: convert(event.locationInWindow, from: nil))?.item)
     }
 }
 
@@ -852,7 +965,7 @@ final class SidewaysScroll: NSScrollView {
 // MARK: - Window
 
 final class Panel: NSPanel {
-    var onCommandReturn: (() -> Void)?
+    var onShortcut: ((NSEvent) -> Bool)?  // ⌘↩, ⌘K and the like; true when it was one
     var onEscape: (() -> Void)?
 
     override var canBecomeKey: Bool { true }
@@ -861,12 +974,7 @@ final class Panel: NSPanel {
     override func cancelOperation(_ sender: Any?) { onEscape?() }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        let isReturn = event.keyCode == 36 || event.keyCode == 76
-        if isReturn && event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command {
-            onCommandReturn?()
-            return true
-        }
-        return super.performKeyEquivalent(with: event)
+        onShortcut?(event) == true || super.performKeyEquivalent(with: event)
     }
 }
 
@@ -902,10 +1010,17 @@ func pressCommandV() {
 }
 
 final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate,
-    NSCollectionViewDataSource, NSCollectionViewDelegate, NSWindowDelegate {
+    NSCollectionViewDataSource, NSCollectionViewDelegate, NSWindowDelegate, NSMenuDelegate {
     enum Row {
         case header(String)
-        case clip(Int)
+        case clip(Clip)
+    }
+
+    /// What the menu next to the search field shows: the history of one type (an index into `types`,
+    /// pins first), or a pinboard.
+    enum Filter: Equatable {
+        case type(Int)
+        case board(String)
     }
 
     static let size = NSSize(width: 768, height: 480)
@@ -922,8 +1037,13 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
     let table = NSTableView()
     let detail: DetailView
     let cards = CardStrip()
+    let emptyHint = label("", size: 13, color: Theme.secondary)
     var footerView: NSView?
     var clips: [Clip] = []
+    var saved = Saved.load()
+    var filter = Filter.type(0)
+    var asking: ((String) -> Void)?  // while the search field takes a pinboard's name, what to do with it
+    var numbered: [Int] = []  // the rows ⌘1 to ⌘9 paste: the items wholly in view, in order
     var loadedStamp = HistoryStamp()
     var loading = false
     var selectingFromCode = false
@@ -957,7 +1077,7 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         // Drag the window by the search bar, footer or preview background; the bar stays at the bottom.
         panel.isMovableByWindowBackground = layout == .window
         panel.delegate = self
-        panel.onCommandReturn = { [weak self] in self?.use(paste: false) }
+        panel.onShortcut = { [weak self] in self?.shortcut($0) ?? false }
         panel.onEscape = { [weak self] in self?.hide() }
 
         blur.material = .popover
@@ -973,25 +1093,20 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         search.focusRingType = .none
         search.font = .systemFont(ofSize: 18)
         search.textColor = Theme.text
-        search.placeholderAttributedString = NSAttributedString(string: "Type to filter entries…", attributes: [
-            .font: NSFont.systemFont(ofSize: 18), .foregroundColor: Theme.secondary,
-        ])
+        search.placeholderAttributedString = placeholder("Type to filter entries…")
         search.delegate = self
         search.frame = NSRect(x: 20, y: 16, width: size.width - 40 - 140, height: 24)
         search.autoresizingMask = [.width]
         root.addSubview(search)
 
-        typeMenu.addItems(withTitles: Controller.types.map(\.title))
         typeMenu.isBordered = false
         typeMenu.font = .systemFont(ofSize: 13)
         typeMenu.contentTintColor = Theme.secondary
         typeMenu.target = self
-        typeMenu.action = #selector(typeChanged)
-        typeMenu.sizeToFit()
-        typeMenu.frame = NSRect(x: size.width - 20 - typeMenu.frame.width, y: 16,
-                                width: typeMenu.frame.width, height: 24)
+        typeMenu.action = #selector(filterChosen)
         typeMenu.autoresizingMask = [.minXMargin]
         root.addSubview(typeMenu)
+        buildFilterMenu()
 
         // Pick up new copies while hidden, so the window opens with them already listed.
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
@@ -1005,8 +1120,17 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(appActivated), name: NSWorkspace.didActivateApplicationNotification, object: nil)
 
+        // An empty pinboard says how to fill it: in the middle of the bar, or of the window's preview.
+        emptyHint.frame = layout == .bar
+            ? NSRect(x: 0, y: Controller.searchHeight + Card.size.height / 2 - 9, width: size.width, height: 18)
+            : NSRect(x: detail.frame.minX, y: detail.frame.midY - 9, width: detail.frame.width, height: 18)
+        emptyHint.alignment = .center
+        emptyHint.autoresizingMask = [.width]
+        emptyHint.isHidden = true
+
         guard layout == .window else {
             addCards(width: size.width)
+            root.addSubview(emptyHint)
             return
         }
         root.addSubview(Fill(Theme.separator, frame: NSRect(x: 0, y: Controller.searchHeight, width: size.width, height: 1)))
@@ -1024,6 +1148,8 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         table.target = self
         table.doubleAction = #selector(doubleClicked)
         table.allowsMultipleSelection = true
+        table.menu = NSMenu()  // filled with the actions as it opens, see menuNeedsUpdate
+        table.menu?.delegate = self
         // No .move: dropping a file in Finder must copy it, never take it out of the history.
         table.setDraggingSourceOperationMask([.copy, .link, .generic], forLocal: false)
         let scroll = NSScrollView(frame: NSRect(x: 0, y: bodyTop, width: Controller.listWidth, height: bodyHeight))
@@ -1034,11 +1160,13 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         scroll.automaticallyAdjustsContentInsets = false
         scroll.contentInsets = NSEdgeInsets(top: 6, left: 0, bottom: 6, right: 0)
         root.addSubview(scroll)
+        renumberWhenScrolled(scroll)
 
         root.addSubview(Fill(Theme.separator, frame: NSRect(x: Controller.listWidth, y: bodyTop, width: 1, height: bodyHeight)))
         root.addSubview(detail)
         root.addSubview(Fill(Theme.separator, frame: NSRect(x: 0, y: size.height - Controller.footerHeight - 1,
                                                              width: size.width, height: 1)))
+        root.addSubview(emptyHint)
     }
 
     /// Replaced when the layout changes in Configure Workflow.
@@ -1063,6 +1191,7 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         cards.dataSource = self
         cards.delegate = self
         cards.onDoubleClick = { [weak self] in self?.use(paste: true) }
+        cards.onMenu = { [weak self] in self?.menu(forCard: $0) }
         cards.setDraggingSourceOperationMask([.copy, .link, .generic], forLocal: false)
         let scroll = SidewaysScroll(frame: NSRect(x: 0, y: Controller.searchHeight - 4, width: width,
                                                   height: Card.size.height + 10))
@@ -1072,24 +1201,36 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         scroll.scrollerStyle = .overlay
         scroll.autoresizingMask = [.width]
         root.addSubview(scroll)
+        renumberWhenScrolled(scroll)
     }
 
-    /// Raycast's action bar: where you are on the left, the main keys on the right.
+    /// Raycast's action bar: where you are on the left, the keys for the selection on the right.
     func footer(width: CGFloat, y: CGFloat) -> NSView {
         let bar = Flipped(frame: NSRect(x: 0, y: y, width: width, height: Controller.footerHeight))
-        let icon = NSImageView(image: symbol("doc.on.clipboard", size: 13) ?? NSImage())
+        var board: String?
+        if case .board(let name) = filter { board = name }
+        let icon = NSImageView(image: symbol(board == nil ? "doc.on.clipboard" : "pin", size: 13) ?? NSImage())
         icon.contentTintColor = Theme.secondary
         icon.frame = NSRect(x: 18, y: 11, width: 18, height: 18)
-        let title = label("Clipboard History", size: 12, weight: .medium, color: Theme.secondary)
-        title.frame = NSRect(x: 42, y: 12, width: 200, height: 16)
+        let keys = keyHints()
+        keys.frame.origin = NSPoint(x: width - 18 - keys.frame.width, y: 0)
+        let title = label(board ?? "Clipboard History", size: 12, weight: .medium, color: Theme.secondary)
+        title.frame = NSRect(x: 42, y: 12, width: max(0, min(200, keys.frame.minX - 12 - 42)), height: 16)
         bar.addSubview(icon)
         bar.addSubview(title)
+        bar.addSubview(keys)
+        return bar
+    }
 
-        var x = width - 18
+    /// Paste, then pinning (taking off a pinboard, on one), then the rest under ⌘K: the keys are on show,
+    /// so how to unpin or tidy a pinboard is there to see.
+    func keyHints() -> NSView {
+        let keys = Flipped()
+        var x: CGFloat = 0
         func place(_ view: NSView, gap: CGFloat = 4) {
             x -= view.frame.width
             view.frame.origin = NSPoint(x: x, y: (Controller.footerHeight - view.frame.height) / 2)
-            bar.addSubview(view)
+            keys.addSubview(view)
             x -= gap
         }
         func text(_ string: String) -> NSTextField {
@@ -1097,21 +1238,56 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
             field.sizeToFit()
             return field
         }
-        let count = selectedClips.count
-        let items = count > 1 ? " \(count) Items" : ""
-        place(keyCap("↩"))
+        func separator() { place(Fill(Theme.separator, frame: NSRect(x: 0, y: 0, width: 1, height: 16)), gap: 12) }
+        place(keyCap("K"))
         place(keyCap("⌘"))
-        place(text("Copy\(items)"), gap: 12)
-        place(Fill(Theme.separator, frame: NSRect(x: 0, y: 0, width: 1, height: 16)), gap: 12)
-        place(keyCap("↩"))
-        place(text("Paste\(items)" + (target?.localizedName.map { " to \($0)" } ?? "")))
-        return bar
+        place(text("Actions"), gap: 12)
+        let chosen = selectedClips
+        if !chosen.isEmpty {
+            separator()
+            if case .board = filter {
+                place(keyCap("⌫"))
+                place(keyCap("⌘"))
+                place(text("Remove"), gap: 12)
+            } else {
+                place(keyCap("P"))
+                place(keyCap("⇧"))
+                place(keyCap("⌘"))
+                place(text(chosen.allSatisfy(saved.isPinned) ? "Unpin" : "Pin"), gap: 12)
+            }
+            separator()
+            place(keyCap("↩"))
+            place(text(pasteTitle))
+        }
+        // Placed leftwards from 0; moved into a view as wide as they are.
+        keys.subviews.forEach { $0.frame.origin.x -= x }
+        keys.frame.size = NSSize(width: -x, height: Controller.footerHeight)
+        return keys
     }
 
-    /// Rebuilt for the app you were in and for how many items are selected.
+    /// "Paste to Safari", "Paste 3 Items to Safari": for the footer and the actions.
+    var pasteTitle: String {
+        "Paste\(itemCount)" + (target?.localizedName.map { " to \($0)" } ?? "")
+    }
+
+    var itemCount: String {
+        let count = selectedClips.count
+        return count > 1 ? " \(count) Items" : ""
+    }
+
+    /// Rebuilt for the app you were in and for what's selected. The bar has no footer: its keys go between
+    /// the search field and the menu.
     func showFooter() {
         footerView?.removeFromSuperview()
-        footerView = footer(width: Controller.size.width, y: Controller.size.height - Controller.footerHeight)
+        if layout == .bar {
+            let keys = keyHints()
+            keys.frame.origin = NSPoint(x: typeMenu.frame.minX - 16 - keys.frame.width, y: 8)
+            keys.autoresizingMask = [.minXMargin]
+            search.frame.size.width = keys.frame.minX - 12 - search.frame.minX
+            footerView = keys
+        } else {
+            footerView = footer(width: Controller.size.width, y: Controller.size.height - Controller.footerHeight)
+        }
         root.addSubview(footerView!)
     }
 
@@ -1139,9 +1315,9 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         if layout == .bar {
             panel.setFrame(bar.offsetBy(dx: 0, dy: -bar.height), display: false)
         } else {
-            showFooter()
             panel.setFrameOrigin(origin(on: screen))
         }
+        showFooter()
         panel.alphaValue = 1
         panel.ignoresMouseEvents = false
         panel.makeKeyAndOrderFront(nil)
@@ -1157,6 +1333,7 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         NSApp.activate(ignoringOtherApps: true)
         panel.makeFirstResponder(search)
         panel.invalidateShadow()
+        numberVisible()
     }
 
     /// Closes the window and, unless you clicked into another app (which then has the keyboard
@@ -1175,8 +1352,10 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
     }
 
     func resetView() {
+        stopAsking()
         search.stringValue = ""
-        typeMenu.selectItem(at: 0)
+        filter = .type(0)
+        buildFilterMenu()
         reload()
     }
 
@@ -1271,8 +1450,8 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         ("All Types", nil), ("Text", .text), ("Links", .link), ("Code", .code), ("Media", .media), ("Colors", .color),
     ]
 
-    func matches(_ clip: Clip, _ query: [UInt8], type: Int) -> Bool {
-        if let category = Controller.types[type].category, clip.category != category { return false }
+    func matches(_ clip: Clip, _ query: [UInt8], category: Clip.Category?) -> Bool {
+        if let category, clip.category != category { return false }
         guard !query.isEmpty else { return true }
         // A plain byte search over the pre-folded text: a few milliseconds for the whole history.
         return clip.searchKey.withUnsafeBytes { key in
@@ -1282,31 +1461,333 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         }
     }
 
-    func reload() {
-        let query = Array(fold(search.stringValue.trimmingCharacters(in: .whitespaces)).utf8)
-        let type = typeMenu.indexOfSelectedItem
+    /// Lists what the filter and the search pick, and selects the newest copy (or the first match when
+    /// searching), or else the item that was selected, when it's still listed.
+    func reload(keeping kept: [Clip] = []) {
+        let query = asking == nil ? Array(fold(search.stringValue.trimmingCharacters(in: .whitespaces)).utf8) : []
         rows = []
-        // Clips are newest first, so a new day starts only when a clip is older than the current day's start;
-        // titles are formatted once per day rather than once per clip. The bar has no titles: each card
-        // says when it was copied.
-        var dayStart = Date.distantFuture
-        for (index, clip) in clips.enumerated() where matches(clip, query, type: type) {
-            if layout == .window, clip.date < dayStart {
-                dayStart = Calendar.current.startOfDay(for: clip.date)
-                rows.append(.header(dayTitle(clip.date)))
+        var newest: Int?
+        switch filter {
+        case .board(let name):
+            let items = saved.boards.first { $0.name == name }?.items ?? []
+            rows = items.filter { matches($0, query, category: nil) }.map { .clip($0) }
+        case .type(let type):
+            let category = Controller.types[type].category
+            let pins = saved.pinned.filter { matches($0, query, category: category) }
+            if layout == .window, !pins.isEmpty { rows.append(.header("Pinned")) }
+            rows += pins.map { .clip($0) }
+            // A pinned item shows only among the pins.
+            let pinned = Set(saved.pinned.map(\.key))
+            // Clips are newest first, so a new day starts only when a clip is older than the current day's start;
+            // titles are formatted once per day rather than once per clip. The bar has no titles: each card
+            // says when it was copied.
+            var dayStart = Date.distantFuture
+            for clip in clips where matches(clip, query, category: category) && !pinned.contains(clip.key) {
+                if layout == .window, clip.date < dayStart {
+                    dayStart = Calendar.current.startOfDay(for: clip.date)
+                    rows.append(.header(dayTitle(clip.date)))
+                }
+                if query.isEmpty, newest == nil { newest = rows.count }
+                rows.append(.clip(clip))
             }
-            rows.append(.clip(index))
         }
         if layout == .bar { cards.reloadData() } else { table.reloadData() }
-        select(rows.firstIndex { if case .clip = $0 { return true } else { return false } })
+        let keptRow = kept.first.flatMap { kept in
+            rows.firstIndex { if case .clip(let clip) = $0 { return clip.isSameItem(as: kept) } else { return false } }
+        }
+        select(keptRow ?? newest ?? rows.firstIndex { if case .clip = $0 { return true } else { return false } })
+        numberVisible()
+        if case .board(let name) = filter, rows.isEmpty, query.isEmpty {
+            emptyHint.stringValue = "Nothing on “\(name)” yet. Add items with ⌘K or a right-click."
+            emptyHint.isHidden = false
+        } else {
+            emptyHint.isHidden = true
+        }
     }
 
-    @objc func typeChanged() {
+    /// The types, then the pinboards with their dots, then what can be done with pinboards.
+    func buildFilterMenu() {
+        let menu = NSMenu()
+        func add(_ title: String, tag: Int, image: NSImage? = nil) {
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.tag = tag
+            item.image = image
+            menu.addItem(item)
+        }
+        menu.autoenablesItems = false
+        for (index, type) in Controller.types.enumerated() { add(type.title, tag: index) }
+        menu.addItem(.separator())
+        add("Pinboards", tag: -100)
+        menu.items.last?.isEnabled = false  // a heading
+        for (index, board) in saved.boards.enumerated() { add(board.name, tag: 100 + index, image: saved.dot(board.name)) }
+        add("New Pinboard…", tag: -1)
+        if case .board(let name) = filter {
+            menu.addItem(.separator())
+            add("Rename “\(name)”…", tag: -2)
+            add("Delete “\(name)”…", tag: -3)
+        }
+        typeMenu.menu = menu
+        switch filter {
+        case .type(let index): typeMenu.selectItem(withTag: index)
+        case .board(let name): typeMenu.selectItem(withTag: 100 + (saved.boards.firstIndex { $0.name == name } ?? 0))
+        }
+        typeMenu.sizeToFit()
+        typeMenu.frame = NSRect(x: root.bounds.width - 20 - typeMenu.frame.width, y: 16,
+                                width: typeMenu.frame.width, height: 24)
+        search.frame.size.width = typeMenu.frame.minX - 12 - search.frame.minX
+        showFooter()
+    }
+
+    @objc func filterChosen() {
+        stopAsking()
+        let tag = typeMenu.selectedTag()
+        switch tag {
+        case -1: return newBoard()
+        case -2: return renameBoard()
+        case -3: return deleteBoard()
+        case 100...: filter = .board(saved.boards[tag - 100].name)
+        default: filter = .type(tag)
+        }
+        buildFilterMenu()
         reload()
         panel.makeFirstResponder(search)
     }
 
-    func controlTextDidChange(_ obj: Notification) { reload() }
+    func controlTextDidChange(_ obj: Notification) {
+        if asking == nil { reload() }
+    }
+
+    // MARK: Pins and pinboards
+
+    func placeholder(_ text: String) -> NSAttributedString {
+        NSAttributedString(string: text, attributes: [.font: NSFont.systemFont(ofSize: 18), .foregroundColor: Theme.secondary])
+    }
+
+    /// Has the search field take a pinboard's name, as Raycast does, rather than a dialog, which would take
+    /// the keyboard from the window and so close it. ↩ answers and Esc cancels.
+    func ask(_ prompt: String, text: String = "", then answer: @escaping (String) -> Void) {
+        asking = answer
+        search.stringValue = text
+        search.placeholderAttributedString = placeholder(prompt)
+        panel.makeFirstResponder(search)
+        search.currentEditor()?.selectAll(nil)
+    }
+
+    func stopAsking() {
+        guard asking != nil else { return }
+        asking = nil
+        search.stringValue = ""
+        search.placeholderAttributedString = placeholder("Type to filter entries…")
+    }
+
+    /// The menu back on what's shown, after choosing one of its pinboard actions.
+    func cancelAsking() {
+        stopAsking()
+        buildFilterMenu()
+        reload()
+    }
+
+    func newBoard(adding chosen: [Clip] = []) {
+        ask("Name the new pinboard and press ↩") { [weak self] name in
+            guard let self else { return }
+            guard !name.isEmpty else { return self.cancelAsking() }
+            if !self.saved.boards.contains(where: { $0.name == name }) {
+                self.saved.boards.append(Saved.Board(name: name, items: []))
+                self.saved.save()
+            }
+            if chosen.isEmpty {
+                self.filter = .board(name)
+                self.buildFilterMenu()
+                self.reload()
+            } else {
+                self.buildFilterMenu()
+                self.add(chosen, to: name)
+            }
+        }
+    }
+
+    func renameBoard() {
+        guard case .board(let name) = filter else { return }
+        ask("Rename “\(name)” and press ↩", text: name) { [weak self] newName in
+            guard let self else { return }
+            if !newName.isEmpty, !self.saved.boards.contains(where: { $0.name == newName }),
+               let index = self.saved.boards.firstIndex(where: { $0.name == name }) {
+                self.saved.boards[index].name = newName
+                self.saved.save()
+                self.filter = .board(newName)
+            }
+            self.cancelAsking()
+        }
+    }
+
+    func deleteBoard() {
+        guard case .board(let name) = filter, let board = saved.boards.first(where: { $0.name == name }) else { return }
+        let items = board.items.count == 1 ? "its 1 item" : "its \(board.items.count) items"
+        ask("Press ↩ to delete “\(name)” and \(items), or Esc to keep it") { [weak self] _ in
+            guard let self else { return }
+            self.saved.boards.removeAll { $0.name == name }
+            self.saved.save()
+            self.filter = .type(0)
+            self.cancelAsking()
+        }
+    }
+
+    /// Pins what's selected, or unpins it when it's all pinned already.
+    func togglePin() {
+        let chosen = selectedClips
+        guard !chosen.isEmpty else { return NSSound.beep() }
+        if chosen.allSatisfy(saved.isPinned) {
+            saved.pinned.removeAll { pin in chosen.contains { $0.isSameItem(as: pin) } }
+        } else {
+            saved.pinned.insert(contentsOf: chosen.filter { !saved.isPinned($0) }.map(Saved.keep), at: 0)
+        }
+        saved.save()
+        reload(keeping: chosen)
+    }
+
+    func add(_ chosen: [Clip], to name: String) {
+        guard let index = saved.boards.firstIndex(where: { $0.name == name }) else { return }
+        let new = chosen.filter { clip in !saved.boards[index].items.contains { $0.isSameItem(as: clip) } }
+        saved.boards[index].items.insert(contentsOf: new.map(Saved.keep), at: 0)
+        saved.save()
+        reload(keeping: chosen)
+    }
+
+    func remove(_ chosen: [Clip], from name: String) {
+        guard let index = saved.boards.firstIndex(where: { $0.name == name }) else { return }
+        saved.boards[index].items.removeAll { item in chosen.contains { $0.isSameItem(as: item) } }
+        saved.save()
+        reload()
+    }
+
+    /// Raycast's action panel, for ⌘K and a right-click: what can be done with the selected items.
+    func actions() -> [NSMenuItem] {
+        let chosen = selectedClips
+        guard !chosen.isEmpty else { return [] }
+        var items: [NSMenuItem] = [
+            // No ↩ shown for Paste: in an open menu ↩ has to choose the highlighted item.
+            ActionItem(pasteTitle) { [weak self] in self?.use(paste: true) },
+            ActionItem("Copy\(itemCount)", key: "\r", .command) { [weak self] in self?.use(paste: false) },
+            .separator(),
+            ActionItem(chosen.allSatisfy(saved.isPinned) ? "Unpin" : "Pin", key: "p", [.command, .shift]) { [weak self] in
+                self?.togglePin()
+            },
+        ]
+        let boards = NSMenu()
+        for board in saved.boards {
+            boards.addItem(ActionItem(board.name, image: saved.dot(board.name)) { [weak self] in self?.add(chosen, to: board.name) })
+        }
+        if !saved.boards.isEmpty { boards.addItem(.separator()) }
+        boards.addItem(ActionItem("New Pinboard…") { [weak self] in self?.newBoard(adding: chosen) })
+        let addTo = NSMenuItem(title: "Add to Pinboard", action: nil, keyEquivalent: "")
+        addTo.submenu = boards
+        items.append(addTo)
+        if case .board(let name) = filter {
+            items.append(ActionItem("Remove from “\(name)”", key: "\u{8}", .command) { [weak self] in
+                self?.remove(chosen, from: name)
+            })
+            items.append(.separator())
+            items.append(ActionItem("Rename “\(name)”…") { [weak self] in self?.renameBoard() })
+            items.append(ActionItem("Delete “\(name)”…") { [weak self] in self?.deleteBoard() })
+        }
+        return items
+    }
+
+    /// ⌘K: the actions, under the selected row or card.
+    func showActions() {
+        let items = actions()
+        guard !items.isEmpty else { return NSSound.beep() }
+        let menu = NSMenu()
+        items.forEach(menu.addItem)
+        if layout == .bar {
+            let card = cards.frameForItem(at: selectedRow)
+            menu.popUp(positioning: nil, at: NSPoint(x: card.minX + 14, y: card.minY + Card.header.maxY), in: cards)
+        } else {
+            let row = table.rect(ofRow: selectedRow)
+            menu.popUp(positioning: nil, at: NSPoint(x: row.minX + 40, y: row.maxY), in: table)
+        }
+    }
+
+    /// A right-click on a row that isn't selected selects it, as in Finder, so the actions are for it.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let row = table.clickedRow
+        guard rows.indices.contains(row), case .clip = rows[row] else { return }  // a day title: no menu
+        if !table.selectedRowIndexes.contains(row) { select(row) }
+        actions().forEach(menu.addItem)
+    }
+
+    func menu(forCard item: Int?) -> NSMenu? {
+        guard let item else { return nil }
+        if !selectedRows.contains(item) { select(item) }
+        let menu = NSMenu()
+        actions().forEach(menu.addItem)
+        return menu
+    }
+
+    static let numberKeys = [kVK_ANSI_1, kVK_ANSI_2, kVK_ANSI_3, kVK_ANSI_4, kVK_ANSI_5, kVK_ANSI_6, kVK_ANSI_7,
+                             kVK_ANSI_8, kVK_ANSI_9]
+
+    /// ⌘↩ copies, ⌘⇧P pins as in Raycast, ⌘K shows the actions, ⌘1 to ⌘9 paste the items in view as in
+    /// Alfred, and on a pinboard ⌘⌫ takes the selection off it, as Finder's key for Move to Trash.
+    func shortcut(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        let key = Int(event.keyCode)
+        switch (flags, key) {
+        case (.command, kVK_Return), (.command, kVK_ANSI_KeypadEnter): use(paste: false)
+        case ([.command, .shift], kVK_ANSI_P): togglePin()
+        case (.command, kVK_ANSI_K): showActions()
+        case (.command, _) where Controller.numberKeys.contains(key):
+            let index = Controller.numberKeys.firstIndex(of: key)!
+            guard numbered.indices.contains(index) else { NSSound.beep(); return true }
+            select(numbered[index])
+            use(paste: true)
+        case (.command, kVK_Delete):
+            guard case .board(let name) = filter else { return false }  // elsewhere it deletes search text
+            remove(selectedClips, from: name)
+        default: return false
+        }
+        return true
+    }
+
+    func renumberWhenScrolled(_ scroll: NSScrollView) {
+        scroll.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(self, selector: #selector(numberVisible),
+                                               name: NSView.boundsDidChangeNotification, object: scroll.contentView)
+    }
+
+    /// Numbers the items wholly in view ⌘1 to ⌘9, as Alfred numbers its results; scrolling renumbers them.
+    @objc func numberVisible(_ notification: Notification? = nil) {
+        if layout == .bar {
+            cards.layoutSubtreeIfNeeded()
+            let visible = cards.visibleRect.insetBy(dx: -1, dy: -1)
+            numbered = (cards.collectionViewLayout?.layoutAttributesForElements(in: visible) ?? [])
+                .filter { visible.contains($0.frame) }.compactMap { $0.indexPath?.item }.sorted()
+        } else {
+            let visible = table.visibleRect
+            let range = table.rows(in: visible)
+            numbered = (range.lowerBound..<range.upperBound).filter { row in
+                guard rows.indices.contains(row), case .clip = rows[row] else { return false }
+                let rect = table.rect(ofRow: row)
+                return rect.minY >= visible.minY - 1 && rect.maxY <= visible.maxY + 1
+            }
+        }
+        numbered = Array(numbered.prefix(9))
+        if layout == .bar {
+            for path in cards.indexPathsForVisibleItems() {
+                (cards.item(at: path)?.view as? Card)?.number.stringValue = number(for: path.item)
+            }
+        } else {
+            let range = table.rows(in: table.visibleRect)
+            for row in range.lowerBound..<range.upperBound {
+                (table.view(atColumn: 0, row: row, makeIfNecessary: false) as? ClipCell)?.number.stringValue = number(for: row)
+            }
+        }
+    }
+
+    func number(for row: Int) -> String {
+        numbered.firstIndex(of: row).map { "⌘\($0 + 1)" } ?? ""
+    }
 
     // MARK: Selection
 
@@ -1322,14 +1803,14 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
     }
 
     var selectedClip: Clip? {
-        guard rows.indices.contains(selectedRow), case .clip(let index) = rows[selectedRow] else { return nil }
-        return clips[index]
+        guard rows.indices.contains(selectedRow), case .clip(let clip) = rows[selectedRow] else { return nil }
+        return clip
     }
 
     var selectedClips: [Clip] {
         selectedRows.compactMap { row in
-            guard rows.indices.contains(row), case .clip(let index) = rows[row] else { return nil }
-            return clips[index]
+            guard rows.indices.contains(row), case .clip(let clip) = rows[row] else { return nil }
+            return clip
         }
     }
 
@@ -1339,6 +1820,7 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
             cards.selectionIndexPaths = row.map { [IndexPath(item: $0, section: 0)] } ?? []
             // With the same margin as the first card has.
             if let row { cards.scrollToVisible(cards.frameForItem(at: row).insetBy(dx: -14, dy: 0)) }
+            showFooter()
             return
         }
         selectingFromCode = true
@@ -1382,8 +1864,17 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         case #selector(NSResponder.moveToBeginningOfDocument(_:)): move(by: -rows.count)
         case #selector(NSResponder.moveToEndOfDocument(_:)): move(by: rows.count)
         // A text field sends Esc as complete: (autocompletion), not cancelOperation:.
-        case #selector(NSResponder.cancelOperation(_:)), #selector(NSResponder.complete(_:)): hide()
-        case #selector(NSResponder.insertNewline(_:)): use(paste: true)
+        // While the field takes a pinboard's name, Esc cancels that and ↩ gives the name.
+        case #selector(NSResponder.cancelOperation(_:)), #selector(NSResponder.complete(_:)):
+            asking == nil ? hide() : cancelAsking()
+        case #selector(NSResponder.insertNewline(_:)):
+            guard let answer = asking else {
+                use(paste: true)
+                return true
+            }
+            let name = search.stringValue.trimmingCharacters(in: .whitespaces)
+            stopAsking()
+            answer(name)
         default: return false
         }
         return true
@@ -1428,11 +1919,11 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
             cell.identifier = .init("header")
             cell.title.stringValue = title
             return cell
-        case .clip(let index):
+        case .clip(let clip):
             let cell = tableView.makeView(withIdentifier: .init("clip"), owner: nil) as? ClipCell ?? ClipCell()
             cell.identifier = .init("clip")
-            let clip = clips[index]
             cell.title.stringValue = clip.title
+            cell.number.stringValue = number(for: row)
             cell.file = nil
             switch clip.kind {
             case .text:
@@ -1460,8 +1951,8 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
     // MARK: Dragging
 
     func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
-        guard case .clip(let index) = rows[row] else { return nil }
-        return clips[index].dragWriter
+        guard case .clip(let clip) = rows[row] else { return nil }
+        return clip.dragWriter
     }
 
     func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession,
@@ -1506,15 +1997,23 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
     func collectionView(_ collectionView: NSCollectionView,
                         itemForRepresentedObjectAt indexPath: IndexPath) -> NSCollectionViewItem {
         let item = collectionView.makeItem(withIdentifier: .init("card"), for: indexPath)
-        if case .clip(let index) = rows[indexPath.item] { (item.view as? Card)?.show(clips[index]) }
+        if case .clip(let clip) = rows[indexPath.item] {
+            // Pins come first in the history, with no day titles in the bar to set them apart.
+            var pinned = false
+            if case .type = filter { pinned = saved.isPinned(clip) }
+            (item.view as? Card)?.show(clip, pinned: pinned)
+            (item.view as? Card)?.number.stringValue = number(for: indexPath.item)
+        }
         return item
     }
 
     func collectionView(_ collectionView: NSCollectionView, didSelectItemsAt indexPaths: Set<IndexPath>) {
+        showFooter()
         keepTyping()
     }
 
     func collectionView(_ collectionView: NSCollectionView, didDeselectItemsAt indexPaths: Set<IndexPath>) {
+        showFooter()
         keepTyping()  // a ⌘-click that takes a card out of the selection
     }
 
@@ -1523,8 +2022,8 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
 
     func collectionView(_ collectionView: NSCollectionView,
                         pasteboardWriterForItemAt indexPath: IndexPath) -> NSPasteboardWriting? {
-        guard case .clip(let index) = rows[indexPath.item] else { return nil }
-        return clips[index].dragWriter
+        guard case .clip(let clip) = rows[indexPath.item] else { return nil }
+        return clip.dragWriter
     }
 
     func collectionView(_ collectionView: NSCollectionView, draggingSession session: NSDraggingSession,
@@ -1563,10 +2062,22 @@ func registerHotKey(key: Int, modifiers: Int) {
                         GetApplicationEventTarget(), 0, &registeredHotKey)
 }
 
+/// The app in the workflow folder. Allowed with Open Anyway, a downloaded app runs from a random
+/// read-only copy (App Translocation, .../AppTranslocation/<UUID>/d/ClipHistory.app), so ask macOS
+/// where the original is, as Sparkle does.
+let appURL: URL = {
+    typealias Create = @convention(c) (CFURL, UnsafeMutablePointer<Unmanaged<CFError>?>?) -> Unmanaged<CFURL>?
+    guard let security = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY),
+          let symbol = dlsym(security, "SecTranslocateCreateOriginalPathForURL"),
+          let original = unsafeBitCast(symbol, to: Create.self)(Bundle.main.bundleURL as CFURL, nil)
+    else { return Bundle.main.bundleURL }
+    return original.takeRetainedValue() as URL
+}()
+
 /// A field of the workflow's Configure Workflow sheet. Alfred saves them to prefs.plist in the workflow
 /// folder, next to the app; there's no file until one is changed.
 func setting(_ variable: String) -> String {
-    let prefs = Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("prefs.plist")
+    let prefs = appURL.deletingLastPathComponent().appendingPathComponent("prefs.plist")
     return NSDictionary(contentsOf: prefs)?[variable] as? String ?? ""
 }
 
@@ -1639,7 +2150,7 @@ func installLoginAgent() {
     let file = agents.appendingPathComponent("\(label).plist")
     let agent: NSDictionary = [
         "Label": label,
-        "ProgramArguments": ["/usr/bin/open", "-g", "-a", Bundle.main.bundlePath, "--args", "--login"],
+        "ProgramArguments": ["/usr/bin/open", "-g", "-a", appURL.path, "--args", "--login"],
         "RunAtLoad": true,
     ]
     if NSDictionary(contentsOf: file) == agent { return }
