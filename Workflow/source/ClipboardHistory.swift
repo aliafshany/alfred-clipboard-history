@@ -929,7 +929,7 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
     var selectingFromCode = false
     var rows: [Row] = []
     var thumbnails: [String: NSImage] = [:]
-    var target: NSRunningApplication?  // the app ↩ pastes into: whatever was in front when the window opened
+    var target: NSRunningApplication?  // the app ↩ pastes into and Esc returns to: the last one you were in
     var dragWatch: Timer?
     var refreshTimer: Timer?
 
@@ -998,6 +998,12 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
             guard let self, !self.panel.isVisible else { return }
             self.refreshIfChanged()
         }
+
+        // The app you were in is the last one to come to the front, kept as it happens: opened through
+        // Alfred (the keyword, or a list of apps to open), this app is already in front by the time the window shows.
+        if let front = NSWorkspace.shared.frontmostApplication { noteFront(front) }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(appActivated), name: NSWorkspace.didActivateApplicationNotification, object: nil)
 
         guard layout == .window else {
             addCards(width: size.width)
@@ -1115,11 +1121,17 @@ final class Controller: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NS
         panel.isVisible ? hide() : show()
     }
 
+    @objc func appActivated(_ notification: Notification) {
+        if let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication { noteFront(app) }
+    }
+
+    /// Only ordinary apps count: Alfred and Spotlight close their windows as this one opens.
+    func noteFront(_ app: NSRunningApplication) {
+        if app.processIdentifier != getpid(), app.activationPolicy == .regular { target = app }
+    }
+
     /// The list is kept ready while the window is hidden, so showing it only has to put it on screen.
     func show() {
-        // The app you were in, for "Paste to …" and for handing focus back; taken before this app activates.
-        let front = NSWorkspace.shared.frontmostApplication
-        if front?.processIdentifier != getpid() { target = front }
         refreshIfChanged()
         let screen = screenWithPointer()
         // The bar spans the bottom of the screen and rises from its edge, as Paste's does.
